@@ -1,3 +1,5 @@
 .venv/
 .canvas-profile/
 courses.json
+canvas_export/
+/canvas_export
