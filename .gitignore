@@ -1,7 +1,10 @@
 .venv/
+venv/
 __pycache__/
 .canvas-profile/
 courses.json
 assignments.json
+assignments.partial.json
+assignment_history/
 canvas_export/
 /canvas_export
