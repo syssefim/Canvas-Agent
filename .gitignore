@@ -6,5 +6,9 @@ courses.json
 assignments.json
 assignments.partial.json
 assignment_history/
+announcements.json
+announcements.partial.json
+announcement_history/
+extracted_canvas_data/
 canvas_export/
 /canvas_export
