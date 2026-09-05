@@ -1,0 +1,7 @@
+# Python dependencies for canvas_embeddings.py. Local hi-res PDF/image
+# partitioning also requires Poppler and Tesseract system packages.
+Pillow>=11,<13
+python-dotenv>=1,<2
+sqlite-vec>=0.1.9,<0.2
+unstructured[pdf]>=0.18.32,<1
+voyageai>=0.5,<1

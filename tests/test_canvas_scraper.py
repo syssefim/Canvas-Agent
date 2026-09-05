@@ -10,12 +10,13 @@ BASE_URL = "https://school.instructure.com"
 
 
 class FakeResponse:
-    def __init__(self, data=None, *, status=200, headers=None, text=""):
+    def __init__(self, data=None, *, status=200, headers=None, text="", body=b""):
         self.data = data
         self.status = status
         self.ok = 200 <= status < 300
         self.headers = headers or {}
         self.body_text = text
+        self.body_bytes = body
         self.disposed = False
 
     def json(self):
@@ -23,6 +24,9 @@ class FakeResponse:
 
     def text(self):
         return self.body_text
+
+    def body(self):
+        return self.body_bytes
 
     def dispose(self):
         self.disposed = True
@@ -185,6 +189,88 @@ class OutputTests(unittest.TestCase):
 
     def test_safe_filename_removes_path_characters(self):
         self.assertEqual(scraper.safe_filename("../../course / 42"), "course_42")
+
+
+class DownloadTests(unittest.TestCase):
+    def test_safe_download_url_allows_same_origin_non_api_paths(self):
+        self.assertTrue(
+            scraper.is_safe_download_url(BASE_URL + "/files/1/download", BASE_URL)
+        )
+        self.assertFalse(
+            scraper.is_safe_download_url(
+                "https://attacker.example/files/1/download", BASE_URL
+            )
+        )
+
+    def test_download_suffix_prefers_display_name_over_mime_guess(self):
+        record = {"display_name": "notes.pdf", "content-type": "application/pdf"}
+        self.assertEqual(scraper._download_suffix(record), ".pdf")
+
+    def test_download_suffix_rejects_unsupported_types(self):
+        record = {"display_name": "slides.pptx", "content-type": "application/vnd.ms-powerpoint"}
+        self.assertIsNone(scraper._download_suffix(record))
+
+    def test_download_course_files_writes_supported_and_skips_unsupported(self):
+        pdf_bytes = b"%PDF-1.4 fake"
+        request = FakeRequest([FakeResponse(status=200, body=pdf_bytes)])
+        stats = scraper.ExportStats()
+        records = [
+            {
+                "id": 1,
+                "display_name": "syllabus.pdf",
+                "url": BASE_URL + "/files/1/download?download_frd=1",
+            },
+            {
+                "id": 2,
+                "display_name": "slides.pptx",
+                "url": BASE_URL + "/files/2/download?download_frd=1",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            course_dir = Path(directory) / "courses" / "1"
+            scraper.download_course_files(
+                request,
+                BASE_URL,
+                "1",
+                course_dir,
+                records,
+                timeout_ms=1000,
+                max_attempts=1,
+                stats=stats,
+            )
+            written = list((course_dir / "files").glob("*"))
+            self.assertEqual(len(written), 1)
+            self.assertTrue(written[0].name.startswith("1-syllabus"))
+            self.assertEqual(written[0].read_bytes(), pdf_bytes)
+        self.assertEqual(stats.download_count, 1)
+        self.assertEqual(stats.download_bytes, len(pdf_bytes))
+        self.assertEqual(len(request.calls), 1)
+
+    def test_download_course_files_records_error_and_continues(self):
+        request = FakeRequest([FakeResponse(status=404)])
+        stats = scraper.ExportStats()
+        records = [
+            {
+                "id": 1,
+                "display_name": "missing.pdf",
+                "url": BASE_URL + "/files/1/download?download_frd=1",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            course_dir = Path(directory) / "courses" / "1"
+            scraper.download_course_files(
+                request,
+                BASE_URL,
+                "1",
+                course_dir,
+                records,
+                timeout_ms=1000,
+                max_attempts=1,
+                stats=stats,
+            )
+        self.assertEqual(stats.download_count, 0)
+        self.assertEqual(len(stats.errors), 1)
+        self.assertEqual(stats.errors[0]["resource"], "files/1")
 
 
 if __name__ == "__main__":

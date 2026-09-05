@@ -12,3 +12,7 @@ announcement_history/
 extracted_canvas_data/
 canvas_export/
 /canvas_export
+.env
+canvas_embeddings.db
+canvas_embeddings.db-shm
+canvas_embeddings.db-wal

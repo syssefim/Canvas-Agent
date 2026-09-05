@@ -5,6 +5,12 @@ This uses Canvas's JSON API through an authenticated Playwright browser context.
 It does not ask for, print, or save a Canvas API token.  On the first run a
 Chromium window opens so the user can complete their school's normal login.
 
+Alongside each course's files.json metadata, the actual bytes of any attached
+PDF, HTML, or image file are downloaded into that course's files/ directory
+(see DOWNLOADABLE_SUFFIXES, kept in sync with canvas_embeddings.py's
+SUPPORTED_SUFFIXES) so canvas_embeddings.py has real documents to index. Pass
+--skip-file-downloads to export metadata only.
+
 Setup:
     python3 -m venv .venv
     .venv/bin/pip install "playwright>=1.52,<2"
@@ -21,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -76,7 +83,29 @@ class ExportStats:
     request_count: int = 0
     resource_count: int = 0
     item_count: int = 0
+    download_count: int = 0
+    download_bytes: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+
+
+# Kept in sync with canvas_embeddings.py's SUPPORTED_SUFFIXES: there is no
+# point downloading a file the embedding indexer cannot process.
+DOWNLOADABLE_SUFFIXES = frozenset(
+    {
+        ".pdf",
+        ".html",
+        ".htm",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".tif",
+        ".tiff",
+        ".bmp",
+        ".heic",
+    }
+)
 
 
 COURSE_RESOURCES = (
@@ -186,6 +215,18 @@ def is_safe_api_url(url: str, base_url: str) -> bool:
     )
 
 
+def is_safe_download_url(url: str, base_url: str) -> bool:
+    # File downloads live at /files/:id/download, not under /api/v1/, so this
+    # only enforces same-origin HTTPS; Canvas may still redirect the request
+    # (for example to an instfs/S3 host) once it is underway.
+    parsed = urlparse(url)
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.fragment == ""
+        and _origin(url) == _origin(base_url)
+    )
+
+
 def api_url(
     base_url: str,
     path: str,
@@ -279,6 +320,57 @@ def request_json(
     raise AssertionError("retry loop ended unexpectedly")
 
 
+def request_binary(
+    request: Any,
+    url: str,
+    description: str,
+    *,
+    base_url: str,
+    timeout_ms: int,
+    max_attempts: int,
+    stats: ExportStats | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> bytes:
+    """Fetch one binary file with the same rate-limit/server-error retries."""
+    if not is_safe_download_url(url, base_url):
+        raise CanvasResponseError(f"Refusing unsafe download URL for {description}")
+
+    for attempt in range(1, max_attempts + 1):
+        if stats is not None:
+            stats.request_count += 1
+        try:
+            response = request.get(url, timeout=timeout_ms, fail_on_status_code=False)
+        except Exception as error:
+            if attempt == max_attempts:
+                raise CanvasExportError(
+                    f"Request failed for {description} after {max_attempts} "
+                    f"attempt(s): {error}"
+                ) from error
+            sleeper(min(MAX_RETRY_SECONDS, float(2 ** (attempt - 1))))
+            continue
+
+        wait: float | None = None
+        try:
+            headers = _headers(response.headers)
+            if response.ok:
+                return response.body()
+
+            status = int(response.status)
+            if (status == 429 or 500 <= status < 600) and attempt < max_attempts:
+                wait = _retry_delay(headers, float(2 ** (attempt - 1)))
+            else:
+                raise CanvasHTTPError(
+                    status, f"Canvas returned HTTP {status} for {description}"
+                )
+        finally:
+            response.dispose()
+
+        if wait is not None:
+            sleeper(wait)
+
+    raise AssertionError("retry loop ended unexpectedly")
+
+
 LINK_PART_RE = re.compile(r'<([^>]+)>\s*((?:;\s*[^,]+)*)')
 REL_RE = re.compile(r'\brel\s*=\s*(?:"([^"]+)"|([^;,\s]+))', re.I)
 
@@ -348,6 +440,26 @@ def atomic_write_json(path: Path, value: Any) -> None:
             temporary = output.name
             json.dump(value, output, ensure_ascii=False, indent=2)
             output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, suffix=".tmp", delete=False
+        ) as output:
+            temporary = output.name
+            output.write(data)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
@@ -429,6 +541,77 @@ def export_resource(
         )
         print(f"    {label}: unavailable ({error})")
         return None
+
+
+def _download_suffix(record: dict[str, Any]) -> str | None:
+    for key in ("display_name", "filename"):
+        name = record.get(key)
+        if isinstance(name, str):
+            suffix = Path(name).suffix.lower()
+            if suffix in DOWNLOADABLE_SUFFIXES:
+                return suffix
+    guessed = mimetypes.guess_extension(str(record.get("content-type") or ""))
+    if guessed and guessed.lower() in DOWNLOADABLE_SUFFIXES:
+        return guessed.lower()
+    return None
+
+
+def download_course_files(
+    request: Any,
+    base_url: str,
+    course_id: str,
+    course_dir: Path,
+    records: Any,
+    *,
+    timeout_ms: int,
+    max_attempts: int,
+    stats: ExportStats,
+) -> None:
+    """Download the actual bytes of attachments the embedding indexer can use.
+
+    files.json only records file metadata (including a download URL); this
+    fetches the PDF/HTML/image bytes themselves so canvas_embeddings.py has
+    real documents under extracted_canvas_data to chunk and embed. Other file
+    types (docx, pptx, video, ...) are skipped since it cannot use them.
+    """
+    if not isinstance(records, list):
+        return
+    output_dir = course_dir / "files"
+    downloaded = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        file_id = record.get("id")
+        url = record.get("url")
+        if file_id in (None, "") or not isinstance(url, str) or not url:
+            continue
+        suffix = _download_suffix(record)
+        if suffix is None:
+            continue
+        stem = safe_filename(
+            Path(str(record.get("display_name") or record.get("filename") or file_id)).stem
+        )
+        destination = output_dir / f"{safe_filename(str(file_id))}-{stem}{suffix}"
+        try:
+            data = request_binary(
+                request,
+                url,
+                f"file {file_id} for course {course_id}",
+                base_url=base_url,
+                timeout_ms=timeout_ms,
+                max_attempts=max_attempts,
+                stats=stats,
+            )
+            atomic_write_bytes(destination, data)
+            downloaded += 1
+            stats.download_count += 1
+            stats.download_bytes += len(data)
+        except CanvasExportError as error:
+            record_error(
+                stats, course_id=course_id, resource=f"files/{file_id}", error=error
+            )
+    if downloaded:
+        print(f"    files downloaded: {downloaded}")
 
 
 def export_details(
@@ -516,6 +699,7 @@ def export_course(
     timeout_ms: int,
     max_attempts: int,
     stats: ExportStats,
+    download_files: bool = True,
 ) -> None:
     course_id = str(course["id"])
     course_dir = root / "courses" / safe_filename(course_id)
@@ -559,6 +743,18 @@ def export_course(
             course_id,
             course_dir,
             resource,
+            timeout_ms=timeout_ms,
+            max_attempts=max_attempts,
+            stats=stats,
+        )
+
+    if download_files:
+        download_course_files(
+            request,
+            base_url,
+            course_id,
+            course_dir,
+            pulled.get("files.json"),
             timeout_ms=timeout_ms,
             max_attempts=max_attempts,
             stats=stats,
@@ -790,6 +986,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="do not show Chromium; requires an existing valid login",
     )
     parser.add_argument(
+        "--skip-file-downloads",
+        action="store_true",
+        help="export files.json metadata only; do not download PDF/HTML/image bytes",
+    )
+    parser.add_argument(
         "--request-timeout",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
@@ -879,6 +1080,7 @@ def main(argv: list[str] | None = None) -> int:
                         timeout_ms=timeout_ms,
                         max_attempts=args.max_attempts,
                         stats=stats,
+                        download_files=not args.skip_file_downloads,
                     )
             finally:
                 context.close()
@@ -905,6 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
         "request_count": stats.request_count,
         "resource_count": stats.resource_count,
         "item_count": stats.item_count,
+        "download_count": stats.download_count,
+        "download_bytes": stats.download_bytes,
         "error_count": len(stats.errors),
         "note": (
             "Canvas only returns data the signed-in account is permitted to see. "
