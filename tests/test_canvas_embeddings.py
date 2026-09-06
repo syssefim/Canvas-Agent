@@ -74,6 +74,51 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(NotADirectoryError):
                 embeddings.discover_documents(regular_file)
 
+    def test_discovers_only_canvas_page_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page = root / "courses" / "42" / "details" / "pages" / "intro.JSON"
+            page.parent.mkdir(parents=True)
+            page.write_text("{}", encoding="utf-8")
+            (root / "courses" / "42" / "assignments.json").write_text(
+                "[]", encoding="utf-8"
+            )
+            self.assertEqual(embeddings.discover_documents(root), [page.resolve()])
+
+    def test_selects_newest_timestamp_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = root / "2026-01-01T00-00-00Z"
+            new = root / "2026-02-01T00-00-00Z"
+            for snapshot in (old, new):
+                snapshot.mkdir()
+                (snapshot / "metadata.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(embeddings.resolve_input_root(root), new.resolve())
+            self.assertEqual(
+                embeddings.resolve_input_root(root, all_snapshots=True), root.resolve()
+            )
+
+    def test_canvas_page_json_is_partitioned_as_escaped_html(self):
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / "courses/42/details/pages/intro.json"
+            page.parent.mkdir(parents=True)
+            page.write_text(
+                '{"title":"A <title>","body":"<p>Hello <b>Canvas</b></p>"}',
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def fake_partition(**kwargs):
+                captured.update(kwargs)
+                return []
+
+            from unstructured.partition import html as html_partition
+
+            with mock.patch.object(html_partition, "partition_html", fake_partition):
+                self.assertEqual(embeddings.partition_document(page), [])
+            self.assertIn("<h1>A &lt;title&gt;</h1>", captured["text"])
+            self.assertIn("<p>Hello <b>Canvas</b></p>", captured["text"])
+
 
 class StructuralChunkTests(unittest.TestCase):
     def test_requests_semantic_chunking_and_retains_original_order(self):

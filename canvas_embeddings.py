@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build a local multimodal vector index from exported Canvas documents.
 
-The indexer recursively processes PDF, HTML, and image files under
-``./extracted_canvas_data``.  Unstructured performs layout-aware partitioning
+The indexer recursively processes PDF, HTML, image files, and Canvas page-detail
+JSON exports under ``./extracted_canvas_data``.  Unstructured performs
+layout-aware partitioning
 and title/page-aware chunking; the original elements are then reconstructed in
 document order so text and visual content are sent to Voyage as interleaved
 inputs.  The resulting 1024-dimensional float vectors are stored with their
@@ -28,8 +29,10 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import html
 import inspect
 import io
+import json
 import logging
 import math
 import mimetypes
@@ -76,6 +79,47 @@ VOYAGE_IMAGE_MIME_TYPES = frozenset(
 VISUAL_CATEGORIES = frozenset({"Image", "Table", "TableChunk"})
 
 LOGGER = logging.getLogger("canvas_embeddings")
+
+
+def is_canvas_page_json(path: Path) -> bool:
+    """Whether *path* is a Canvas page-detail JSON export.
+
+    Canvas exports from ``canvas_scraper.py`` contain many JSON files, including
+    grades, roster data, and request metadata.  Only page-detail records contain
+    course HTML suitable for this index, so JSON is intentionally allow-listed.
+    """
+    parts = [part.casefold() for part in path.parts]
+    return (
+        path.suffix.casefold() == ".json"
+        and len(parts) >= 3
+        and parts[-2] == "pages"
+        and parts[-3] == "details"
+        and "courses" in parts[:-2]
+    )
+
+
+def resolve_input_root(root: Path, *, all_snapshots: bool = False) -> Path:
+    """Select the newest scraper snapshot when a parent export is supplied."""
+    root = root.expanduser().resolve()
+    if all_snapshots or not root.is_dir():
+        return root
+    snapshots = sorted(
+        (
+            child
+            for child in root.iterdir()
+            if child.is_dir()
+            and (child / "metadata.json").is_file()
+            and len(child.name) >= 20
+            and child.name[4:5] == "-"
+            and child.name[7:8] == "-"
+        ),
+        key=lambda child: child.name,
+    )
+    if snapshots:
+        selected = snapshots[-1]
+        LOGGER.info("Using newest Canvas snapshot: %s", selected)
+        return selected.resolve()
+    return root
 
 
 class CanvasEmbeddingError(RuntimeError):
@@ -180,7 +224,10 @@ def discover_documents(
     excluded = {path.expanduser().resolve(strict=False) for path in excluded_paths}
     documents: list[Path] = []
     for path in root.rglob("*"):
-        if path.is_symlink() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        if path.is_symlink():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES and not is_canvas_page_json(path):
             continue
         try:
             resolved = path.resolve(strict=True)
@@ -197,6 +244,45 @@ def discover_documents(
 
 def partition_document(path: Path, languages: Sequence[str] = ()) -> list[Any]:
     """Partition one supported document with Unstructured."""
+    if is_canvas_page_json(path):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid Canvas page JSON: {error}") from error
+        if not isinstance(payload, dict) or payload.get("complete") is False:
+            return []
+        title = payload.get("title")
+        body = payload.get("body")
+        if not isinstance(body, str) or not body.strip():
+            return []
+        title_html = (
+            f"<h1>{html.escape(title.strip())}</h1>"
+            if isinstance(title, str) and title.strip()
+            else ""
+        )
+        fragment = f"<html><body>{title_html}{body}</body></html>"
+        try:
+            from unstructured.partition.html import partition_html
+        except ImportError as error:
+            raise DependencyError(
+                "Unstructured HTML dependencies are missing; install "
+                "requirements-embeddings.txt"
+            ) from error
+        try:
+            return list(
+                partition_html(
+                    text=fragment,
+                    filename=str(path),
+                    extract_image_block_to_payload=True,
+                    extract_image_block_types=["Image"],
+                )
+            )
+        except LookupError as error:
+            raise DependencyError(
+                "Unstructured NLP data is missing; run `.venv/bin/python -m "
+                "nltk.downloader punkt_tab averaged_perceptron_tagger_eng`"
+            ) from error
+
     common_kwargs: dict[str, Any] = {
         "filename": str(path),
         "extract_image_block_to_payload": True,
@@ -917,14 +1003,16 @@ def build_index(
     batch_size: int,
     max_characters: int,
     languages: Sequence[str] = (),
+    all_snapshots: bool = False,
 ) -> IndexStats:
     """Build a complete temporary index and atomically replace the final DB."""
-    input_root = input_root.expanduser().resolve()
+    input_root = resolve_input_root(input_root, all_snapshots=all_snapshots)
     database_path = database_path.expanduser().resolve()
     documents = discover_documents(input_root, excluded_paths=(database_path,))
     if not documents:
         raise CanvasEmbeddingError(
-            f"no supported PDF, HTML, or image files found under {input_root}"
+            "no supported PDF, HTML, image, or Canvas page-detail JSON files "
+            f"found under {input_root}"
         )
 
     stats = IndexStats(discovered_files=len(documents))
@@ -1018,7 +1106,8 @@ def build_index(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Structurally chunk local Canvas PDFs, HTML, and images; create "
+            "Structurally chunk local Canvas PDFs, HTML, images, and Canvas "
+            "page exports; create "
             "Voyage multimodal embeddings; and store them in sqlite-vec."
         )
     )
@@ -1027,6 +1116,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=DEFAULT_INPUT_DIR,
         help="directory to scan recursively (default: ./extracted_canvas_data)",
+    )
+    parser.add_argument(
+        "--all-snapshots",
+        action="store_true",
+        help="index every timestamped snapshot instead of only the newest one",
     )
     parser.add_argument(
         "--database",
@@ -1099,6 +1193,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_size=args.batch_size,
             max_characters=args.max_characters,
             languages=args.language,
+            all_snapshots=args.all_snapshots,
         )
     except (CanvasEmbeddingError, OSError, ValueError, sqlite3.Error) as error:
         LOGGER.error("%s", error)
