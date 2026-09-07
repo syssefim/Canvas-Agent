@@ -116,6 +116,9 @@ class DiscoveryTests(unittest.TestCase):
 
             with mock.patch.object(html_partition, "partition_html", fake_partition):
                 self.assertEqual(embeddings.partition_document(page), [])
+            # Supplying both text and filename makes Unstructured prefer the
+            # on-disk JSON file over the generated HTML fragment.
+            self.assertNotIn("filename", captured)
             self.assertIn("<h1>A &lt;title&gt;</h1>", captured["text"])
             self.assertIn("<p>Hello <b>Canvas</b></p>", captured["text"])
 

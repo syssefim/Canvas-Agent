@@ -272,7 +272,6 @@ def partition_document(path: Path, languages: Sequence[str] = ()) -> list[Any]:
             return list(
                 partition_html(
                     text=fragment,
-                    filename=str(path),
                     extract_image_block_to_payload=True,
                     extract_image_block_types=["Image"],
                 )
